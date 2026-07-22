@@ -44,3 +44,7 @@ make build
 ## Config
 
 If you're looking for `config.json` to have it regenerated, it's in `dist/data/state/config/config.json`.
+
+## Docker/Podman build
+
+`podman build -f docker/Dockerfile.local -t <tag> .`
