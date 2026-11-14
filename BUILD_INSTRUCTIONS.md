@@ -48,3 +48,10 @@ If you're looking for `config.json` to have it regenerated, it's in `dist/data/s
 ## Docker/Podman build
 
 `podman build -f docker/Dockerfile.local -t <tag> .`
+
+## Additional notes
+
+When changing credentials (access_key_id, secret_access_key, etc...) or the
+encryption key for S3 and other backends, params are persisted in your browser
+so in order for them to be applied, you need to log out and then log back in...
+Found this out the hard way.

@@ -2,6 +2,10 @@ package plg_backend_s3
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -33,6 +37,7 @@ type S3Backend struct {
 	Context    context.Context
 	threadSize int
 	timeout    time.Duration
+	aesKey     []byte
 }
 
 func init() {
@@ -41,9 +46,20 @@ func init() {
 }
 
 func (b *S3Backend) Init(params map[string]string, app *App) (IBackend, error) {
-	if params["encryption_key"] != "" && len(params["encryption_key"]) != 32 {
-		return nil, NewError(fmt.Sprintf("Encryption key needs to be 32 characters (current: %d)", len(params["encryption_key"])), 400)
+	var err error
+	var aesKey []byte
+
+	if params["encryption_key"] != "" {
+		if len(params["encryption_key"]) != 64 {
+			return nil, NewError(fmt.Sprintf("Encryption key needs to be 64 hex characters (64 hex chars -> 32 byte key for AES256) (current: %d)", len(params["encryption_key"])), 400)
+		}
+
+		aesKey, err = hex.DecodeString(params["encryption_key"])
+		if err != nil {
+			return nil, NewError(fmt.Sprintf("Could not hex decode encryption key"), 400)
+		}
 	}
+
 	region := params["region"]
 	if region == "" {
 		region = "us-east-1"
@@ -52,7 +68,6 @@ func (b *S3Backend) Init(params map[string]string, app *App) (IBackend, error) {
 		}
 	}
 
-	var err error
 	var cfg aws.Config
 	var creds aws.CredentialsProvider
 	if params["access_key_id"] != "" && params["secret_access_key"] != "" {
@@ -107,6 +122,7 @@ func (b *S3Backend) Init(params map[string]string, app *App) (IBackend, error) {
 		Context:    app.Context,
 		threadSize: threadSize,
 		timeout:    timeout,
+		aesKey:     aesKey,
 	}
 	return backend, nil
 }
@@ -172,7 +188,7 @@ func (b *S3Backend) LoginForm() Form {
 				Id:          "s3_encryption_key",
 				Name:        "encryption_key",
 				Type:        "text",
-				Placeholder: "Encryption Key",
+				Placeholder: "Encryption Key (64 hex chars)",
 			},
 			FormElement{
 				Id:          "s3_number_thread",
@@ -337,23 +353,11 @@ func (b *S3Backend) Cat(path string) (io.ReadCloser, error) {
 		Key:    aws.String(p.path),
 	}
 
-	if b.params["encryption_key"] != "" {
-		input.SSECustomerAlgorithm = aws.String("AES256")
-		input.SSECustomerKey = aws.String(b.params["encryption_key"])
-	}
-
 	obj, err := b.client.GetObject(ctx, input)
 	if err != nil {
 		var apiErr smithy.APIError
 		if errors.As(err, &apiErr) {
 			switch apiErr.ErrorCode() {
-			case "InvalidRequest":
-				input.SSECustomerAlgorithm = nil
-				input.SSECustomerKey = nil
-				obj, err = b.client.GetObject(ctx, input)
-				if err != nil {
-					return nil, err
-				}
 			case "AccessDenied":
 				return nil, ErrNotAllowed
 			case "InvalidObjectState":
@@ -364,6 +368,27 @@ func (b *S3Backend) Cat(path string) (io.ReadCloser, error) {
 		} else {
 			return nil, err
 		}
+	}
+
+	ivHex, isEncrypted := obj.Metadata["iv"]
+
+	if isEncrypted {
+		if b.aesKey == nil {
+			obj.Body.Close()
+			return nil, NewError("Object is encrypted but no encryption key was provided", 400)
+		}
+		iv, err := hex.DecodeString(ivHex)
+		if err != nil || len(iv) != aes.BlockSize {
+			obj.Body.Close()
+			return nil, NewError(fmt.Sprintf("Invalid encryption metadata for %s", path), 400)
+		}
+		block, _ := aes.NewCipher(b.aesKey)
+		stream := cipher.NewCTR(block, iv)
+
+		return &readCloser{
+			cipher.StreamReader{S: stream, R: obj.Body},
+			obj.Body,
+		}, nil
 	}
 
 	return obj.Body, nil
@@ -498,12 +523,6 @@ func (b *S3Backend) Mv(from string, to string) error {
 			Bucket:     aws.String(t.bucket),
 			Key:        aws.String(t.path),
 		}
-		if b.params["encryption_key"] != "" {
-			copyInput.CopySourceSSECustomerAlgorithm = aws.String("AES256")
-			copyInput.CopySourceSSECustomerKey = aws.String(b.params["encryption_key"])
-			copyInput.SSECustomerAlgorithm = aws.String("AES256")
-			copyInput.SSECustomerKey = aws.String(b.params["encryption_key"])
-		}
 		_, err := client.CopyObject(ctx, copyInput)
 		if err != nil {
 			return err
@@ -531,12 +550,6 @@ func (b *S3Backend) Mv(from string, to string) error {
 					CopySource: aws.String(fmt.Sprintf("%s/%s", f.bucket, srcKey)),
 					Bucket:     aws.String(t.bucket),
 					Key:        aws.String(dstKey),
-				}
-				if b.params["encryption_key"] != "" {
-					copyInput.CopySourceSSECustomerAlgorithm = aws.String("AES256")
-					copyInput.CopySourceSSECustomerKey = aws.String(b.params["encryption_key"])
-					copyInput.SSECustomerAlgorithm = aws.String("AES256")
-					copyInput.SSECustomerKey = aws.String(b.params["encryption_key"])
 				}
 				_, err := client.CopyObject(ctx, copyInput)
 				if err != nil {
@@ -598,10 +611,6 @@ func (b *S3Backend) Touch(path string) error {
 		Key:           aws.String(p.path),
 		ContentType:   aws.String(GetMimeType(path)),
 	}
-	if b.params["encryption_key"] != "" {
-		input.SSECustomerAlgorithm = aws.String("AES256")
-		input.SSECustomerKey = aws.String(b.params["encryption_key"])
-	}
 	_, err := b.client.PutObject(ctx, input)
 	return err
 }
@@ -611,17 +620,34 @@ func (b *S3Backend) Save(path string, file io.Reader) error {
 	ctx := b.Context
 
 	tm := transfermanager.New(b.client)
-	input := &transfermanager.UploadObjectInput{
-		Bucket:      aws.String(p.bucket),
-		Key:         aws.String(p.path),
-		Body:        file,
-		ContentType: aws.String(GetMimeType(path)),
+	input := &transfermanager.UploadObjectInput{}
+
+	if b.aesKey != nil {
+		// err is ignored bc this can't fail, the key has already been validated in Init
+		block, _ := aes.NewCipher(b.aesKey)
+
+		iv := make([]byte, aes.BlockSize)
+
+		if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+			return err
+		}
+
+		stream := cipher.NewCTR(block, iv)
+
+		reader := cipher.StreamReader{S: stream, R: file}
+
+		input.Body = reader
+		input.Metadata = map[string]string{
+			"encryption": "aes-ctr-256",
+			"iv": hex.EncodeToString(iv),
+		}
+	} else {
+		input.Body = file
 	}
 
-	if b.params["encryption_key"] != "" {
-		input.SSECustomerAlgorithm = aws.String("AES256")
-		input.SSECustomerKey = aws.String(b.params["encryption_key"])
-	}
+	input.Bucket = aws.String(p.bucket)
+	input.Key = aws.String(p.path)
+	input.ContentType = aws.String(GetMimeType(path))
 
 	_, err := tm.UploadObject(ctx, input)
 	return err
@@ -630,6 +656,11 @@ func (b *S3Backend) Save(path string, file io.Reader) error {
 type S3Path struct {
 	bucket string
 	path   string
+}
+
+type readCloser struct {
+	io.Reader
+	io.Closer
 }
 
 func (b *S3Backend) path(p string) S3Path {
